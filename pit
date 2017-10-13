@@ -1,0 +1,357 @@
+#!/usr/bin/env ruby
+
+# Pit - Source control for binary files via Google Drive
+# Author: Thanasis Papoutsidakis - Nerf Us team 2017
+# License: GNU LGPL 3.0
+
+require 'set'
+require 'json'
+require 'digest/md5'
+
+def extract_ginfo(field, info)
+    /#{field}:[[:space:]](.*?)[[:cntrl:]]/.match(info)[1]
+end
+
+def get_ginfo(field, id)
+    extract_ginfo(field, `gdrive info #{id}`)
+end
+
+def is_gdir(id)
+   get_ginfo("Mime", id) == "application/vnd.google-apps.folder"
+end
+
+def test_ignores(path, ignorefile)
+    return false unless File.exist?(ignorefile)
+    File.foreach(ignorefile, "\n") {
+        |regex| return true if !regex.strip.empty? && /#{regex.strip}/ === path }
+    return false
+end
+
+def is_ignored_push(path)
+    ["push.pitignore", ".pit/push.pitignore", "pull.pitignore", ".pit/pull.pitignore"].any? {
+        |a| test_ignores(path, a) }
+end
+
+def is_ignored_pull(path)
+    ["pull.pitignore", ".pit/pull.pitignore"].any? {
+        |a| test_ignores(path, a) }
+end
+
+# Globals
+$codex = Hash.new
+$md5cache = nil
+$accessmarks = Set.new
+
+def getmd5(path)
+    if $md5cache.nil?
+        if File.exist?(".pit/md5cache")
+            File.open(".pit/md5cache", "r") {|f| $md5cache = JSON.load(f)}
+        else
+            $md5cache = Hash.new
+        end
+    end
+    if $md5cache[path].nil? || File.mtime(path) != $md5cache[path]["date"]
+        $md5cache[path] = {
+            "md5" => Digest::MD5.hexdigest(File.read(path)),
+            "date" => File.mtime(path) }
+    end
+    return $md5cache[path]["md5"]
+end
+
+def setmd5(path, md5hash)
+    if $md5cache.nil?
+        if File.exist?(".pit/md5cache")
+            File.open(".pit/md5cache", "r") {|f| $md5cache = JSON.load(f)}
+        else
+            $md5cache = Hash.new
+        end
+    end
+    if md5hash.nil?
+        $md5cache.delete(path)
+    else
+        $md5cache[path] = {
+            "md5" => md5hash,
+            "date" => File.mtime(path) }
+    end
+end
+
+def add_l(path, remid)
+    return if is_ignored_push(path)
+    case ARGV[0]
+    when "status"
+        puts "Add: #{path}"
+    when "push"
+        if Dir.exist?(path)
+            `gdrive mkdir -p #{remid} "#{File.basename path}"`
+            $codex[path] = {}
+            newid = `gdrive list --no-header -q "'#{remid}' in parents and name = '#{path.basename}'"`.split[0]
+            scan(path, newid)
+        else
+            `gdrive upload -p #{remid} "#{path}"`
+            newid = `gdrive list --no-header -q "'#{remid}' in parents and name = '#{File.basename path}'"`.split[0]
+            md5hash = get_ginfo("Md5sum", newid)
+            $codex[path] = {"md5" => md5hash}
+            setmd5(path, md5hash)
+        end
+        puts "Added: #{path}"
+    end
+end
+
+def add_r(path, rinfo, rginfo)
+    return if is_ignored_pull(path)
+    case ARGV[0]
+    when "status"
+        puts "(incoming) Add: #{path}"
+    when "clone", "pull"
+        if rinfo[2] == "dir"
+            Dir.mkdir path
+            $codex[path] = {}
+            scan(path, rinfo[0])
+        else
+            basedir = Dir.pwd
+            Dir.chdir File.dirname path
+            `gdrive download "#{rinfo[0]}"`
+            Dir.chdir basedir
+            md5hash = extract_ginfo("Md5sum", rginfo)
+            $codex[path] = {"md5" => md5hash}
+            setmd5(path, md5hash)
+        end
+        puts "Received (add): #{path}"
+    when "init"
+        $codex[path] = {"md5" => extract_ginfo("Md5sum", rginfo)}
+        puts "(outgoing) Remove: #{path}"
+    end
+end
+
+## Action for when file was deleted locally.
+##
+def remove_l(path, rinfo)
+    return if is_ignored_push(path)
+    case ARGV[0]
+    when "status"
+        puts "Remove: #{path}"
+    when "init", "clone"
+        puts "(outgoing) Remove: #{path}"
+    when "push"
+        `gdrive delete "#{rinfo[0]}"`
+        $codex.delete(path)
+        setmd5(path, nil)
+        puts "Removed: #{path}"
+    end
+end
+
+## Action for when file was removed on remote.
+##
+def remove_r(path)
+    return if is_ignored_pull(path)
+    case ARGV[0]
+    when "status"
+        puts "(incoming) Remove: #{path}"
+    when "init"
+        $codex.delete(path)
+        puts "(outgoing) Add: #{path}"
+    when "clone", "pull"
+        File.unlink path
+        $codex.delete(path)
+        setmd5(path, nil)
+        puts "Received (remove): #{path}"
+    end
+end
+
+def modify_l(path, rinfo)
+    return if is_ignored_push(path)
+    case ARGV[0]
+    when "status"
+        puts "Modify: #{path}"
+    when "init"
+        puts "(outgoing) Modify: #{path}"
+    when "push"
+        `gdrive update "#{rinfo[0]}" "#{path}"`
+        $codex[path]["md5"] = getmd5(path)
+        puts "Modified: #{path}"
+    end
+end
+
+def modify_r(path, rinfo, rginfo)
+    return if is_ignored_pull(path)
+    case ARGV[0]
+    when "status", "clone"
+        puts "(incoming) Modify: #{path}"
+    when "init"
+        $codex[path]["md5"] = extract_ginfo("Md5sum", rginfo)
+        puts "(outgoing) Modify: #{path}"
+    when "pull"
+        File.unlink path
+        basedir = Dir.pwd
+        Dir.chdir File.dirname path
+        `gdrive download "#{rinfo[0]}"`
+        Dir.chdir basedir
+        md5hash = extract_ginfo("Md5sum", rginfo)
+        $codex[path]["md5"] = md5hash
+        setmd5(path, md5hash)
+        puts "Received (modify): #{path}"
+    end
+end
+
+## Action when file is same in local and remote.
+## For files, refresh codex entry.
+## For directories, descend recursively and scan.
+##
+def same(path, rinfo)
+    case ARGV[0]
+    when "status", "pull", "clone"
+        return if is_ignored_pull(path)
+    when "push", "init"
+        return if is_ignored_push(path)
+    end
+    if Dir.exist?(path)
+        scan(path, rinfo[0])
+    else
+        $codex[path] = {"md5" => getmd5(path)}
+    end
+end
+
+## Action when files differ in local, remote and codex.
+## Inform user that either local or remote version must be kept.
+##
+def conflict(path, rinfo)
+    case ARGV[0]
+    when "status", "pull", "clone"
+        return if is_ignored_pull(path)
+    when "push", "init"
+        return if is_ignored_push(path)
+    end
+    puts "Conflict: #{path}"
+    $codex.delete(path)
+    if !File.exist?(path)
+        puts "File was modified online while you removed it."
+        puts "To remove completely, do so manually via google drive."
+        puts "To accept online file, use 'pit pull'."
+    elsif rinfo.nil?
+        puts "File was removed online."
+        puts "To remove completely, do so manually."
+        puts "To reupload it, your changes included, use 'pit push'."
+    else
+        puts "File was modified both locally and online."
+        puts "Please remove the unwanted version manually,"
+        puts "then use pit pull / push respectively to synchronize."
+    end
+end
+
+## Recursively scan local and remote directories for changes.
+##
+def scan(localdir, remid)
+    loclist = `ls -l #{localdir}`.split("\n").drop(1).map {|s| s.split }.sort {|a, b| a[-1] <=> b[-1] }
+    remlist = `gdrive list --no-header --name-width 0 -m 0 -q "\'#{remid}\' in parents and trashed = false"`.split("\n").map {|s| s.split }.sort {|a, b| a[1] <=> b[1] }
+    for linfo in loclist
+        fname = linfo.drop(8).join(" ")
+        path = "#{localdir}/#{fname}"
+        rinfo = remlist.bsearch {|x| x[1] >= fname}
+        rinfo = (!rinfo.nil? && rinfo[1] == fname)? rinfo : nil
+        if $codex[path].nil?
+            if rinfo.nil?
+                add_l(path, remid)
+            elsif Dir.exist?(path) || getmd5(path) == get_ginfo("Md5sum", rinfo[0])
+                same(path, rinfo)
+            else
+                conflict(path, rinfo)
+            end
+        elsif rinfo.nil?
+            if Dir.exist?(path) || $codex[path]["md5"] == getmd5(path)
+                remove_r(path)
+            else
+                conflict(path, nil)
+            end
+        else
+            rginfo = `gdrive info #{rinfo[0]}`
+            if Dir.exist?(path)
+                same(path, rinfo)
+            elsif $codex[path]["md5"] == getmd5(path)
+                if $codex[path]["md5"] == extract_ginfo("Md5sum", rginfo)
+                    same(path, rinfo)
+                else
+                    modify_r(path, rinfo, rginfo)
+                end
+            else
+                if $codex[path]["md5"] == extract_ginfo("Md5sum", rginfo)
+                    modify_l(path, rinfo)
+                elsif getmd5(path) == extract_ginfo("Md5sum", rginfo)
+                    same(path, rinfo)
+                else
+                    conflict(path, rinfo)
+                end
+            end
+        end
+        $accessmarks.add(path)
+    end
+    for rinfo in remlist
+        path = "#{localdir}/#{rinfo[1]}"
+        next if File.exist?(path)  # Already processed in local file scan above
+        rginfo = `gdrive info #{rinfo[0]}`
+        if $codex[path].nil?
+            add_r(path, rinfo, rginfo)
+        elsif rinfo[2] == "dir" || $codex[path]["md5"] == extract_ginfo("Md5sum", rginfo)
+            remove_l(path, rinfo)
+        else
+            conflict(path, rinfo)
+        end
+        $accessmarks.add(path)
+    end
+end
+
+case ARGV[0]
+when "init"
+    (puts "Pit already initialized"; exit 1) if Dir.exist?(".pit")
+    (puts "Please provide a remote folder id"; exit 127) if ARGV[1].nil?
+    (puts "Remote id is not a folder"; exit 127) unless is_gdir ARGV[1]
+    Dir.mkdir ".pit"
+    File.open(".pit/remote", "w") {|f| f.puts ARGV[1]}
+    scan(".", ARGV[1])
+    puts "Pit project initialized"
+when "clone"
+    (puts "Please provide a remote folder id"; exit 127) if ARGV[1].nil?
+    (puts "Remote id is not a folder"; exit 127) unless is_gdir ARGV[1]
+    clone_folder_name = ARGV[2].nil? ? get_ginfo("Name", ARGV[1]) : ARGV[2]
+    (puts "#{clone_folder_name}: Directory already exists"; exit 1) if Dir.exist?(clone_folder_name)
+    Dir.mkdir clone_folder_name
+    Dir.chdir clone_folder_name
+    Dir.mkdir ".pit"
+    File.open(".pit/remote", "w") {|f| f.puts ARGV[1]}
+    scan(".", ARGV[1])
+when "status", "push", "pull"
+    (puts "Not a pit project"; exit 1) unless Dir.exist?(".pit")
+    File.open(".pit/codex", "r") {|f| $codex = JSON.load(f)}
+    scan(".", File.read(".pit/remote").strip)
+when "help", nil
+    puts("Usage: pit [command]",
+         "",
+         "Where [command] is:",
+         "    init: Initialize project with pit",
+         "    clone: Download and connect to pit project",
+         "    status: List changes among local and remote",
+         "    pull: Download changes from remote",
+         "    push: Send changes to remote",
+         "    help: Show this help message",
+         "",
+         "Pit-specific files:",
+         "    push.pitignore: files to ignore when pushing (project-wide)",
+         "    pull.pitignore: files to ignore when pulling (project-wide)",
+         "    .pit/push.pitignore: files to ignore when pushing (user-specific)",
+         "    .pit/pull.pitignore: files to ignore when pulling (user-specific)")
+    exit
+else
+    puts "pit: unknown command. Use 'pit help' for usage."
+    exit 127
+end
+
+$codex.delete_if {|k, v|
+    if $accessmarks.include?(k)
+        false
+    else
+        puts "Removed (common): #{k}"
+        true
+    end}
+File.open(".pit/codex", "w") {|f| JSON.dump($codex, f)}
+if !$md5cache.nil?
+    File.open(".pit/md5cache", "w") {|f| JSON.dump($md5cache, f)}
+end
